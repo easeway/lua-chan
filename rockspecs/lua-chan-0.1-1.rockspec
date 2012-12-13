@@ -6,7 +6,7 @@ source = {
 description = {
     summary = "Simple and fast message queue for Lua",
     homepage = "http://github.com/easeway/lua-chan",
-    license = "MIT/X11",
+    license = "MIT",
 }
 dependencies = {
     "lua >= 5.1",
