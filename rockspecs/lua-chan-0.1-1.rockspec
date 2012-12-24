@@ -1,7 +1,8 @@
 package = "lua-chan"
 version = "0.1-1"
 source = {
-    url = "git://github.com/easeway/lua-chan.git"
+    url = "git://github.com/easeway/lua-chan.git",
+    branch = "v0.1-1"
 }
 description = {
     summary = "Simple and fast message queue for Lua",
