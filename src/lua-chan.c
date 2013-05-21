@@ -17,10 +17,15 @@
 // WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#include <stdlib.h>
-#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <time.h>
 #include <pthread.h>
+#endif
+
+#include <stdlib.h>
+#include <string.h>
 
 #include "lua.h"
 #include "lauxlib.h"
@@ -52,9 +57,15 @@ struct queue_t
     struct msg_t* msg_tail;
     int limit;
     int count;
+#ifdef _WIN32
+    CRITICAL_SECTION lock;
+    HANDLE send_sig;
+    HANDLE recv_sig;
+#else
     pthread_mutex_t lock;
     pthread_cond_t send_sig;
     pthread_cond_t recv_sig;
+#endif    
     struct queue_t* prev;
     struct queue_t* next;
     int refs;
@@ -70,9 +81,15 @@ static struct queue_t* queue_create(const char* name, int limit)
     q->msg_head = q->msg_tail = NULL;
     q->limit = limit;
     q->count = 0;
+#ifdef _WIN32
+    InitializeCriticalSection(&q->lock);
+    q->send_sig = CreateEvent(NULL, FALSE, FALSE, NULL);
+    q->recv_sig = CreateEvent(NULL, FALSE, FALSE, NULL);
+#else
     pthread_mutex_init(&q->lock, NULL);
     pthread_cond_init(&q->send_sig, NULL);
     pthread_cond_init(&q->recv_sig, NULL);
+#endif    
     q->prev = q->next = NULL;
     q->refs = 1;
     TRACE("queue_create: %s, limit=%d\n", name, limit);
@@ -83,6 +100,11 @@ static void queue_destroy(struct queue_t* q)
 {
     struct msg_t *msgs = q->msg_head, *last = NULL;
     TRACE("queue_destroy: %s\n", q->name);
+#ifdef _WIN32
+    CloseHandle(q->send_sig);
+    CloseHandle(q->recv_sig);
+    DeleteCriticalSection(&q->lock);
+#endif
     free(q);
     while (msgs)
     {
@@ -94,12 +116,20 @@ static void queue_destroy(struct queue_t* q)
 
 static void queue_lock(struct queue_t* q)
 {
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+#else
     pthread_mutex_lock(&q->lock);
+#endif
 }
 
 static void queue_unlock(struct queue_t* q)
 {
+#ifdef _WIN32
+    LeaveCriticalSection(&q->lock);
+#else
     pthread_mutex_unlock(&q->lock);
+#endif
 }
 
 static long queue_acquire(struct queue_t* q)
@@ -130,6 +160,7 @@ static long queue_release(struct queue_t* q)
     return refs;
 }
 
+#ifndef _WIN32
 static int timeout_to_timespec(int timeout, struct timespec* ts)
 {
     if (timeout < 0)
@@ -140,13 +171,31 @@ static int timeout_to_timespec(int timeout, struct timespec* ts)
     ts->tv_nsec = ts->tv_nsec % 1000000000L;
     return 1;
 }
+#endif
 
 static int queue_send(struct queue_t* q, struct msg_t* msg, int timeout)
 {
+#ifdef _WIN32
+    DWORD timeoutTick;
+#else
     struct timespec ts;
+#endif
 
     queue_lock(q);
 
+#ifdef _WIN32
+    timeoutTick = GetTickCount() + timeout;
+    while (timeout != 0 && q->limit >= 0 && q->count + 1 > q->limit)
+    {
+        if (timeout > 0)
+        {
+            if (GetTickCount() >= timeoutTick || WaitForSingleObject(q->send_sig, (DWORD)timeout) == WAIT_OBJECT_0)
+                break;
+        }
+        else
+            WaitForSingleObject(q->send_sig, INFINITE);
+    }
+#else
     if (timeout > 0 && q->limit >= 0 && q->count + 1 > q->limit)
         timeout_to_timespec(timeout, &ts);
     while (timeout != 0 && q->limit >= 0 && q->count + 1 > q->limit)
@@ -159,6 +208,7 @@ static int queue_send(struct queue_t* q, struct msg_t* msg, int timeout)
         else
             pthread_cond_wait(&q->send_sig, &q->lock);
     }
+#endif
 
     if (q->limit < 0 || q->count + 1 <= q->limit)
     {
@@ -169,7 +219,11 @@ static int queue_send(struct queue_t* q, struct msg_t* msg, int timeout)
         if (q->msg_head == NULL)
             q->msg_head = msg;
         q->count ++;
+#ifdef _WIN32
+        SetEvent(q->recv_sig);
+#else
         pthread_cond_signal(&q->recv_sig);
+#endif
     }
     else
     {
@@ -183,15 +237,36 @@ static int queue_send(struct queue_t* q, struct msg_t* msg, int timeout)
 static struct msg_t* queue_recv(struct queue_t* q, int timeout)
 {
     struct msg_t* msg = NULL;
+#ifdef _WIN32
+    DWORD timeoutTick;
+#else
     struct timespec ts;
+#endif
 
     queue_lock(q);
     if (q->limit >= 0)
     {
         q->limit ++;
+#ifdef _WIN32
+        SetEvent(q->send_sig);
+#else
         pthread_cond_signal(&q->send_sig);
+#endif
     }
 
+#ifdef _WIN32
+    timeoutTick = GetTickCount() + timeout;
+    while (timeout != 0 && q->count <= 0)
+    {
+        if (timeout > 0)
+        {
+            if (GetTickCount() >= timeoutTick || WaitForSingleObject(q->recv_sig, (DWORD)timeout) == WAIT_OBJECT_0)
+                break;
+        }
+        else
+            WaitForSingleObject(q->recv_sig, INFINITE);
+    }
+#else
     if (timeout > 0 && q->count <= 0)
         timeout_to_timespec(timeout, &ts);
     while (timeout != 0 && q->count <= 0)
@@ -204,6 +279,7 @@ static struct msg_t* queue_recv(struct queue_t* q, int timeout)
         else
             pthread_cond_wait(&q->recv_sig, &q->lock);
     }
+#endif
 
     if (q->count > 0)
     {
@@ -216,7 +292,11 @@ static struct msg_t* queue_recv(struct queue_t* q, int timeout)
             msg->next = NULL;
         }
         q->count --;
+#ifdef _WIN32
+        SetEvent(q->recv_sig);
+#else
         pthread_cond_signal(&q->send_sig);
+#endif
     }
 
     if (q->limit > 0)
@@ -234,7 +314,11 @@ struct entry_t
 };
 
 static struct entry_t _queues[BUCKET_SIZE];
+#ifdef _WIN32
+static CRITICAL_SECTION _queues_lock;
+#else
 static pthread_mutex_t _queues_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 static int name_hash(const char* name)
 {
@@ -262,10 +346,18 @@ static struct queue_t* bucket_search(int bucket, const char* name)
 static int queues_add(struct queue_t* q)
 {
     int hash = name_hash(q->name);
+#ifdef _WIN32
+    EnterCriticalSection(&_queues_lock);
+#else
     pthread_mutex_lock(&_queues_lock);
+#endif
     if (bucket_search(hash, q->name))
     {
+#ifdef _WIN32
+        LeaveCriticalSection(&_queues_lock);
+#else
         pthread_mutex_unlock(&_queues_lock);
+#endif        
         return 0;
     }
     q->next = NULL;
@@ -276,7 +368,11 @@ static int queues_add(struct queue_t* q)
     if (!_queues[hash].head)
         _queues[hash].head = q;
     q->bucket = hash;
+#ifdef _WIN32
+    LeaveCriticalSection(&_queues_lock);
+#else    
     pthread_mutex_unlock(&_queues_lock);
+#endif    
     TRACE("queues_add: %s bucket=%d\n", q->name, hash);
     return 1;
 }
@@ -285,11 +381,19 @@ static struct queue_t* queues_get(const char* name)
 {
     int hash = name_hash(name);
     struct queue_t* q = NULL;
+#ifdef _WIN32
+    EnterCriticalSection(&_queues_lock);
+#else
     pthread_mutex_lock(&_queues_lock);
+#endif    
     q = bucket_search(hash, name);
     if (q)
         queue_acquire(q);
+#ifdef _WIN32
+    LeaveCriticalSection(&_queues_lock);
+#else    
     pthread_mutex_unlock(&_queues_lock);
+#endif  
     return q;
 }
 
@@ -444,9 +548,17 @@ static int chan_gc(lua_State* L)
 {
     struct queue_t* q = _lua_arg_queue(L);
     TRACE("chan_gc: %s, refs=%d\n", q->name, q->refs);
+#ifdef _WIN32
+    EnterCriticalSection(&_queues_lock);
+#else
     pthread_mutex_lock(&_queues_lock);
+#endif    
     queue_release(q);
+#ifdef _WIN32
+    LeaveCriticalSection(&_queues_lock);
+#else    
     pthread_mutex_unlock(&_queues_lock);
+#endif      
     return 0;
 }
 
@@ -511,6 +623,9 @@ static const luaL_Reg chan_fns[] = {
 
 int luaopen_chan(lua_State* L)
 {
+#ifdef _WIN32
+    InitializeCriticalSection(&_queues_lock);
+#endif
     luaL_newmetatable(L, METATABLE_NAME);
     lua_pushvalue(L, -1);
     lua_setfield(L, -2, "__index");
